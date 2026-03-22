@@ -1,14 +1,12 @@
 """
-AnalyticGAN -- Professional Interactive Dashboard
-Uses Plotly for interactive charts with hover, zoom, click
+AnalyticGAN -- Charts-Only Interactive Dashboard
 """
-import os, sys, pickle, joblib
+import os, sys, pickle, joblib, time
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,8 +14,8 @@ from torch.nn.utils import spectral_norm
 from sklearn.mixture import BayesianGaussianMixture
 from sklearn.preprocessing import LabelEncoder
 from scipy.spatial.distance import jensenshannon
+from scipy.spatial import cKDTree
 
-# ---- Paths ----
 _app_dir = os.path.dirname(os.path.abspath(__file__))
 BASE     = os.path.dirname(_app_dir)
 CKPT_DIR = os.path.join(BASE, "checkpoints")
@@ -26,21 +24,19 @@ FEATURES = [f"V{i}" for i in range(1, 29)] + ["Amount"]
 
 st.set_page_config(page_title="AnalyticGAN", page_icon="🧬", layout="wide")
 
-# ---- Model Classes ----
+# ---- Classes ----
 class VGMEncoder:
     def __init__(self, n_components=10, eps=0.005):
         self.n_components=n_components; self.eps=eps
         self.bgm=BayesianGaussianMixture(n_components=n_components,weight_concentration_prior_type="dirichlet_process",weight_concentration_prior=0.001,max_iter=100,random_state=42,n_init=1)
         self.valid_components=None; self.n_valid=None
     def fit(self,data):
-        self.bgm.fit(np.asarray(data).reshape(-1,1))
-        self.valid_components=np.where(self.bgm.weights_>self.eps)[0]; self.n_valid=len(self.valid_components); return self
+        self.bgm.fit(np.asarray(data).reshape(-1,1)); self.valid_components=np.where(self.bgm.weights_>self.eps)[0]; self.n_valid=len(self.valid_components); return self
     def transform(self,data):
         data=np.asarray(data).reshape(-1,1); means=self.bgm.means_[self.valid_components].flatten(); stds=np.sqrt(self.bgm.covariances_[self.valid_components]).flatten()
         probs=self.bgm.predict_proba(data)[:,self.valid_components]; mode_idx=[]
         for p in probs:
-            s=p.sum(); p_norm=(p/s).astype(np.float64) if(s>0 and np.isfinite(s)) else np.ones(self.n_valid)/self.n_valid
-            mode_idx.append(np.random.choice(self.n_valid,p=p_norm))
+            s=p.sum(); p_norm=(p/s).astype(np.float64) if(s>0 and np.isfinite(s)) else np.ones(self.n_valid)/self.n_valid; mode_idx.append(np.random.choice(self.n_valid,p=p_norm))
         mode_idx=np.array(mode_idx); normalized=np.clip((data.flatten()-means[mode_idx])/(4*stds[mode_idx]+1e-8),-0.99,0.99)
         one_hot=np.zeros((len(data),self.n_valid),dtype=np.float32); one_hot[np.arange(len(data)),mode_idx]=1
         return np.column_stack([normalized,one_hot]).astype(np.float32)
@@ -50,15 +46,12 @@ class VGMEncoder:
 
 class TabularPreprocessor:
     def __init__(self,max_gmm_components=10,eps=0.005):
-        self.max_gmm_components=max_gmm_components;self.eps=eps;self.continuous_cols=[];self.categorical_cols=[];self.target_col=None
-        self.vgm_encoders={};self.label_encoders={};self.cat_dims={};self.output_info=[];self.output_dim=0
+        self.max_gmm_components=max_gmm_components;self.eps=eps;self.continuous_cols=[];self.categorical_cols=[];self.target_col=None;self.vgm_encoders={};self.label_encoders={};self.cat_dims={};self.output_info=[];self.output_dim=0
     def inverse_transform(self,tensor):
         data=tensor.detach().cpu().numpy() if hasattr(tensor,"detach") else tensor; result={};idx=0
         for kind,col,size in self.output_info:
-            if kind=="continuous":
-                w=1+self.vgm_encoders[col].n_valid; result[col]=self.vgm_encoders[col].inverse_transform(data[:,idx:idx+w]); idx+=w
-            else:
-                n_cat=self.cat_dims[col]; result[col]=self.label_encoders[col].inverse_transform(np.argmax(data[:,idx:idx+n_cat],axis=1)); idx+=n_cat
+            if kind=="continuous": w=1+self.vgm_encoders[col].n_valid; result[col]=self.vgm_encoders[col].inverse_transform(data[:,idx:idx+w]); idx+=w
+            else: n_cat=self.cat_dims[col]; result[col]=self.label_encoders[col].inverse_transform(np.argmax(data[:,idx:idx+n_cat],axis=1)); idx+=n_cat
         return pd.DataFrame(result)
     @staticmethod
     def load(path):
@@ -71,9 +64,7 @@ class ResidualBlock(nn.Module):
 
 class SelfAttention(nn.Module):
     def __init__(self,dim):
-        super().__init__(); ad=max(dim//8,1)
-        self.query=nn.Linear(dim,ad,bias=False);self.key=nn.Linear(dim,ad,bias=False);self.value=nn.Linear(dim,ad,bias=False)
-        self.out_proj=nn.Linear(ad,dim,bias=False);self.scale=ad**-0.5
+        super().__init__(); ad=max(dim//8,1); self.query=nn.Linear(dim,ad,bias=False); self.key=nn.Linear(dim,ad,bias=False); self.value=nn.Linear(dim,ad,bias=False); self.out_proj=nn.Linear(ad,dim,bias=False); self.scale=ad**-0.5
     def forward(self,x):
         Q,K,V=self.query(x),self.key(x),self.value(x); return x+self.out_proj(F.softmax(Q@K.T*self.scale,dim=-1)@V)
 
@@ -81,10 +72,8 @@ class Generator(nn.Module):
     def __init__(self,latent_dim,cond_dim,output_dim,output_info,hidden_dims=None):
         super().__init__()
         if hidden_dims is None: hidden_dims=[256,256]
-        self.output_info=output_info
-        self.input_layer=nn.Sequential(nn.Linear(latent_dim+cond_dim,hidden_dims[0]),nn.BatchNorm1d(hidden_dims[0]),nn.ReLU())
-        self.res_blocks=nn.ModuleList([ResidualBlock(d) for d in hidden_dims])
-        self.self_attn=SelfAttention(hidden_dims[-1]); self.output_layer=nn.Linear(hidden_dims[-1],output_dim)
+        self.output_info=output_info; self.input_layer=nn.Sequential(nn.Linear(latent_dim+cond_dim,hidden_dims[0]),nn.BatchNorm1d(hidden_dims[0]),nn.ReLU())
+        self.res_blocks=nn.ModuleList([ResidualBlock(d) for d in hidden_dims]); self.self_attn=SelfAttention(hidden_dims[-1]); self.output_layer=nn.Linear(hidden_dims[-1],output_dim)
     def forward(self,z,cond):
         x=self.input_layer(torch.cat([z,cond],dim=1))
         for b in self.res_blocks: x=b(x)
@@ -92,411 +81,403 @@ class Generator(nn.Module):
     def _apply_activations(self,x):
         out=[];idx=0
         for kind,_,size in self.output_info:
-            if kind=="continuous":
-                out.append(torch.tanh(x[:,idx:idx+1]));out.append(F.softmax(x[:,idx+1:idx+1+size],dim=1));idx+=1+size
-            else: out.append(F.softmax(x[:,idx:idx+size],dim=1));idx+=size
+            if kind=="continuous": out.append(torch.tanh(x[:,idx:idx+1])); out.append(F.softmax(x[:,idx+1:idx+1+size],dim=1)); idx+=1+size
+            else: out.append(F.softmax(x[:,idx:idx+size],dim=1)); idx+=size
         return torch.cat(out,dim=1)
 
-# ---- Load Models ----
+# ---- Load ----
 @st.cache_resource
 def load_models():
     prep=TabularPreprocessor.load(os.path.join(CKPT_DIR,"preprocessor.pkl"))
-    cond_vec=np.load(os.path.join(CKPT_DIR,"cond_vec.npy"))
-    G=Generator(latent_dim=128,cond_dim=cond_vec.shape[1],output_dim=prep.output_dim,output_info=prep.output_info)
-    _sd=torch.load(os.path.join(CKPT_DIR,"generator_final.pt"),map_location="cpu")
-    _sd={k.replace("_orig_mod.",""):v for k,v in _sd.items()}
-    G.load_state_dict(_sd);G.eval()
-    clf_path=os.path.join(CKPT_DIR,"fraud_classifier.pkl")
-    clf=joblib.load(clf_path) if os.path.isfile(clf_path) else None
-    history=None
+    cv=np.load(os.path.join(CKPT_DIR,"cond_vec.npy"))
+    G=Generator(128,cv.shape[1],prep.output_dim,prep.output_info)
+    sd=torch.load(os.path.join(CKPT_DIR,"generator_final.pt"),map_location="cpu")
+    sd={k.replace("_orig_mod.",""):v for k,v in sd.items()}
+    G.load_state_dict(sd); G.eval()
+    clf=joblib.load(os.path.join(CKPT_DIR,"fraud_classifier.pkl")) if os.path.isfile(os.path.join(CKPT_DIR,"fraud_classifier.pkl")) else None
+    h=None
     hp=os.path.join(CKPT_DIR,"training_history.pkl")
     if os.path.isfile(hp):
-        with open(hp,"rb") as f: history=pickle.load(f)
-    return prep,cond_vec,G,clf,history
+        with open(hp,"rb") as f: h=pickle.load(f)
+    return prep,cv,G,clf,h
 
 @st.cache_data
-def load_real_data():
-    import kagglehub
-    _k=kagglehub.dataset_download("mlg-ulb/creditcardfraud")
-    return pd.read_csv(os.path.join(_k,"creditcard.csv"))
+def load_real():
+    import kagglehub; k=kagglehub.dataset_download("mlg-ulb/creditcardfraud")
+    return pd.read_csv(os.path.join(k,"creditcard.csv"))
 
-def _jsd_column(a, b, bins=50):
-    """Jensen-Shannon on shared-bin histograms (density-normalized)."""
-    a = np.asarray(a).ravel()
-    b = np.asarray(b).ravel()
-    lo = float(min(a.min(), b.min()))
-    hi = float(max(a.max(), b.max()))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return 0.0
-    edges = np.linspace(lo, hi, bins + 1)
-    p, _ = np.histogram(a, bins=edges, density=True)
-    q, _ = np.histogram(b, bins=edges, density=True)
-    p = np.asarray(p, dtype=np.float64) + 1e-10
-    q = np.asarray(q, dtype=np.float64) + 1e-10
-    return float(jensenshannon(p / p.sum(), q / q.sum()))
+prep,cond_vec,G,clf,history=load_models()
+df_real=load_real()
+ctgan_path=os.path.join(CKPT_DIR,"synthetic_sample.csv")
+df_ctgan=pd.read_csv(ctgan_path) if os.path.isfile(ctgan_path) else None
 
-prep,cond_vec,G,clf,history = load_models()
+# ---- Helpers ----
+def gen_synth(n,fp=0.20):
+    nf=int(n*fp); nl=n-nf; lb=np.concatenate([np.ones(nf),np.zeros(nl)]); np.random.shuffle(lb)
+    c=torch.tensor(np.eye(2)[lb.astype(int)],dtype=torch.float32)
+    with torch.no_grad(): z=torch.randn(n,128); o=G(z,c)
+    df=prep.inverse_transform(o); df["Class"]=lb.astype(int); return df
 
-# ---- Custom CSS ----
-st.markdown("""
-<style>
-    .main-header {font-size:2.5rem; font-weight:700; background:linear-gradient(90deg,#378ADD,#1D9E75); -webkit-background-clip:text; -webkit-text-fill-color:transparent;}
-    .metric-card {background:linear-gradient(135deg,#1e1e2e,#2d2d44); padding:20px; border-radius:12px; border-left:4px solid; margin-bottom:10px;}
-    .metric-card h3 {color:#999; font-size:0.85rem; margin:0;}
-    .metric-card p {color:#fff; font-size:1.8rem; font-weight:700; margin:5px 0 0 0;}
-    div[data-testid="stSidebar"] {background:linear-gradient(180deg,#0e1117,#1a1a2e);}
-    .stTabs [data-baseweb="tab"] {font-weight:600;}
-</style>
-""", unsafe_allow_html=True)
+def jsd(r,s,bins=50):
+    lo=min(r.min(),s.min()); hi=max(r.max(),s.max()); e=np.linspace(lo,hi,bins+1)
+    p,_=np.histogram(r,bins=e,density=True); q,_=np.histogram(s,bins=e,density=True)
+    p=p+1e-10; q=q+1e-10; return jensenshannon(p/p.sum(),q/q.sum())
+
+C = {"blue":"#4facfe","red":"#f5576c","green":"#43e97b","purple":"#667eea","pink":"#fa709a","orange":"#f093fb","gray":"#a8b2d1"}
+
+# ---- CSS ----
+st.markdown("""<style>
+.hdr{background:linear-gradient(135deg,#1a1a2e,#16213e,#0f3460);padding:1.5rem 2rem;border-radius:12px;margin-bottom:1.2rem;color:white}
+.hdr h1{color:white;font-size:2rem;margin:0}.hdr p{color:#a8b2d1;margin:0}
+.mc{padding:1rem;border-radius:10px;text-align:center;color:white;margin-bottom:0.8rem}
+.mc .v{font-size:1.6rem;font-weight:bold}.mc .l{font-size:0.8rem;opacity:0.85}
+#MainMenu{visibility:hidden}footer{visibility:hidden}.stDeployButton{display:none}
+</style>""",unsafe_allow_html=True)
+
+def hdr(t,s=""): st.markdown(f'<div class="hdr"><h1>{t}</h1><p>{s}</p></div>',unsafe_allow_html=True)
+def mc(l,v,c="#667eea"): st.markdown(f'<div class="mc" style="background:linear-gradient(135deg,{c},{c}aa)"><div class="v">{v}</div><div class="l">{l}</div></div>',unsafe_allow_html=True)
 
 # ---- Sidebar ----
-st.sidebar.markdown("## 🧬 AnalyticGAN")
-st.sidebar.markdown("*Synthetic Fraud Data Platform*")
-st.sidebar.markdown("---")
-page = st.sidebar.radio("", [
-    "🏠 Dashboard",
-    "⚡ Generate Data",
-    "🔍 Fraud Detector",
-    "📊 Distribution Explorer",
-    "📈 Training Monitor",
-    "🏆 Model Comparison",
-])
-st.sidebar.markdown("---")
-st.sidebar.markdown("**EAI 6020** | Northeastern University")
-st.sidebar.markdown("Bigyan Khadka | Spring 2026")
-
-
-# ======== DASHBOARD ========
-if page == "🏠 Dashboard":
-    st.markdown('<p class="main-header">AnalyticGAN Dashboard</p>', unsafe_allow_html=True)
-    st.markdown("Privacy-Preserving Synthetic Data Generation for Fraud Detection")
-
-    # KPI Row
-    c1,c2,c3,c4 = st.columns(4)
-    with c1:
-        st.markdown('<div class="metric-card" style="border-color:#378ADD;"><h3>DATASET SIZE</h3><p>284,807</p></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="metric-card" style="border-color:#D85A30;"><h3>FRAUD RATE</h3><p>0.17%</p></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown('<div class="metric-card" style="border-color:#1D9E75;"><h3>FEATURES</h3><p>29</p></div>', unsafe_allow_html=True)
-    with c4:
-        n_ep = len(history["d_loss"]) if history else 0
-        st.markdown(f'<div class="metric-card" style="border-color:#7F77DD;"><h3>EPOCHS TRAINED</h3><p>{n_ep}</p></div>', unsafe_allow_html=True)
-
+with st.sidebar:
+    st.markdown("## 🧬 AnalyticGAN")
+    st.caption("EAI 6020 | Northeastern University")
     st.markdown("---")
+    page=st.radio("",["🏠 Overview","⚡ Generator","🔍 Fraud Detector","📊 Distribution Lab","📈 Training","🧪 Evaluation","⚔️ GAN vs FM","📉 Metrics"],label_visibility="collapsed")
+    st.markdown("---")
+    st.caption("Bigyan Khadka | Prof. Siddharth Rout")
+    st.markdown("[GitHub](https://github.com/bigyankhadka423/analyticgan)")
 
-    # Architecture + W-distance gauge
-    col1,col2 = st.columns([2,1])
-    with col1:
-        st.markdown("### Architecture")
-        st.markdown("""
-        | Component | Design |
-        |---|---|
-        | **Generator** | Residual Blocks + Self-Attention |
-        | **Discriminator** | Spectral Norm + PacGAN (pac=2) |
-        | **Loss** | WGAN-GP (lambda=10) |
-        | **Encoding** | Variational Gaussian Mixture |
-        | **Sampling** | Fraud oversampled to 20% |
-        | **Baseline** | Flow Matching (OT-CFM) |
-        """)
+# ======== OVERVIEW ========
+if page=="🏠 Overview":
+    hdr("🧬 AnalyticGAN","Privacy-Preserving Synthetic Data for Fraud Detection")
+    c1,c2,c3,c4,c5=st.columns(5)
+    with c1: mc("Dataset","284,807",C["blue"])
+    with c2: mc("Fraud Rate","0.17%",C["red"])
+    with c3: mc("Features","29",C["purple"])
+    with c4: mc("Epochs",f"{len(history['d_loss'])}" if history else "-",C["green"])
+    with c5: mc("W-Distance",f"{history['w_dist'][-1]:.3f}" if history else "-",C["pink"])
 
-    with col2:
-        if history:
-            final_w = history["w_dist"][-1]
-            fig_gauge = go.Figure(go.Indicator(
-                mode="gauge+number+delta",
-                value=final_w,
-                title={"text":"W-Distance","font":{"size":16}},
-                delta={"reference":history["w_dist"][0],"decreasing":{"color":"#1D9E75"}},
-                gauge={
-                    "axis":{"range":[0,5],"tickwidth":1},
-                    "bar":{"color":"#378ADD"},
-                    "steps":[
-                        {"range":[0,1],"color":"#1D9E75"},
-                        {"range":[1,2],"color":"#FFC107"},
-                        {"range":[2,5],"color":"#D85A30"}],
-                    "threshold":{"line":{"color":"red","width":2},"thickness":0.75,"value":final_w}
-                }))
-            fig_gauge.update_layout(height=250,margin=dict(t=50,b=0,l=20,r=20))
-            st.plotly_chart(fig_gauge,use_container_width=True)
+    c1,c2,c3=st.columns(3)
+    with c1:
+        fig,ax=plt.subplots(figsize=(5,4))
+        cts=df_real["Class"].value_counts().sort_index()
+        bars=ax.bar(["Legit","Fraud"],cts.values,color=[C["blue"],C["red"]],edgecolor="white",linewidth=1.5)
+        for b,v in zip(bars,cts.values): ax.text(b.get_x()+b.get_width()/2,b.get_height()+1000,f"{v:,}",ha="center",fontsize=10,fontweight="bold")
+        ax.set_title("Class Imbalance",fontweight="bold"); ax.set_ylabel("Count"); st.pyplot(fig); plt.close()
+    with c2:
+        fig,ax=plt.subplots(figsize=(5,4))
+        ax.hist(df_real["Amount"],bins=100,color=C["purple"],alpha=0.8,edgecolor="white")
+        ax.set_title("Transaction Amount",fontweight="bold"); ax.set_xlabel("$"); ax.set_xlim(0,500); st.pyplot(fig); plt.close()
+    with c3:
+        fig,ax=plt.subplots(figsize=(5,4))
+        fraud=df_real[df_real["Class"]==1]; legit=df_real[df_real["Class"]==0].sample(500,random_state=42)
+        ax.scatter(legit["V1"],legit["V2"],alpha=0.3,s=5,c=C["blue"],label="Legit")
+        ax.scatter(fraud["V1"],fraud["V2"],alpha=0.7,s=12,c=C["red"],label="Fraud")
+        ax.set_title("V1 vs V2",fontweight="bold"); ax.legend(fontsize=8); st.pyplot(fig); plt.close()
 
-    # Quick metrics from CSVs
-    st.markdown("### Evaluation Snapshot")
-    mc1,mc2,mc3 = st.columns(3)
-    ml_path = os.path.join(CKPT_DIR,"ml_efficacy.csv")
-    if os.path.isfile(ml_path):
-        df_ml = pd.read_csv(ml_path)
-        with mc1:
-            trtr_row = df_ml[df_ml["Setup"].str.contains("TRTR|baseline",case=False,na=False)]
-            if not trtr_row.empty:
-                st.metric("TRTR ROC-AUC",f"{trtr_row.iloc[0]['ROC-AUC']:.4f}")
-        with mc2:
-            tstr_row = df_ml[df_ml["Setup"].str.contains("TSTR|synthetic",case=False,na=False)]
-            if not tstr_row.empty:
-                st.metric("TSTR ROC-AUC",f"{tstr_row.iloc[0]['ROC-AUC']:.4f}")
-    fm_path = os.path.join(CKPT_DIR,"flow_matching_comparison.csv")
-    if os.path.isfile(fm_path):
-        with mc3:
-            df_fm = pd.read_csv(fm_path)
-            if "Flow Matching" in df_fm.columns:
-                jsd_val = df_fm[df_fm["Metric"]=="Mean JSD"]["Flow Matching"].values
-                if len(jsd_val)>0:
-                    st.metric("FM Mean JSD",f"{jsd_val[0]}")
+    # Correlation heatmap
+    fig,ax=plt.subplots(figsize=(12,5))
+    corr=df_real[FEATURES[:15]].corr()
+    im=ax.imshow(corr.values,cmap="coolwarm",vmin=-1,vmax=1)
+    ax.set_xticks(range(15)); ax.set_xticklabels(FEATURES[:15],rotation=45,ha="right",fontsize=8)
+    ax.set_yticks(range(15)); ax.set_yticklabels(FEATURES[:15],fontsize=8)
+    ax.set_title("Feature Correlation Matrix (Top 15)",fontweight="bold")
+    plt.colorbar(im,ax=ax,fraction=0.046); plt.tight_layout(); st.pyplot(fig); plt.close()
 
 
-# ======== GENERATE DATA ========
-elif page == "⚡ Generate Data":
-    st.markdown('<p class="main-header">Synthetic Data Generator</p>', unsafe_allow_html=True)
-
-    col1,col2,col3 = st.columns(3)
-    with col1: n_samples = st.slider("Samples",100,10000,2000,100)
-    with col2: fraud_pct = st.slider("Fraud %",1,50,20,1)/100.0
-    with col3: st.markdown(f"**{int(n_samples*fraud_pct)}** fraud / **{n_samples-int(n_samples*fraud_pct)}** legit")
+# ======== GENERATOR ========
+elif page=="⚡ Generator":
+    hdr("⚡ Synthetic Data Generator","Generate and analyze synthetic transactions")
+    c1,c2=st.columns(2)
+    with c1: n=st.slider("Samples",100,10000,2000,100)
+    with c2: fp=st.slider("Fraud %",1,50,20,1)/100.0
 
     if st.button("Generate",type="primary",use_container_width=True):
-        progress = st.progress(0,text="Preparing latent vectors...")
-        n_fraud=int(n_samples*fraud_pct);n_legit=n_samples-n_fraud
-        labels=np.concatenate([np.ones(n_fraud),np.zeros(n_legit)]);np.random.shuffle(labels)
-        eye=np.eye(2);cond=torch.tensor(eye[labels.astype(int)],dtype=torch.float32)
+        bar=st.progress(0); bar.progress(30); df_g=gen_synth(n,fp); bar.progress(100); time.sleep(0.2); bar.empty()
+        st.session_state["gen"]=df_g
+        nf=int(df_g["Class"].sum())
+        c1,c2,c3,c4=st.columns(4)
+        with c1: mc("Total",f"{n:,}",C["blue"])
+        with c2: mc("Fraud",f"{nf:,}",C["red"])
+        with c3: mc("Legit",f"{n-nf:,}",C["green"])
+        with c4: mc("Fraud %",f"{fp*100:.0f}%",C["pink"])
 
-        progress.progress(30,text="Running generator...")
-        with torch.no_grad():
-            z=torch.randn(n_samples,128);out=G(z,cond)
-        progress.progress(70,text="Decoding to tabular format...")
-        df_gen=prep.inverse_transform(out);df_gen["Class"]=labels.astype(int)
-        progress.progress(100,text="Done!")
+    if "gen" in st.session_state:
+        df_g=st.session_state["gen"]
+        t1,t2,t3=st.tabs(["Charts","Data","Quality"])
+        with t1:
+            c1,c2=st.columns(2)
+            with c1:
+                fig,ax=plt.subplots(figsize=(6,4))
+                cts=df_g["Class"].value_counts().sort_index()
+                ax.bar(["Legit","Fraud"],cts.values,color=[C["blue"],C["red"]],edgecolor="white")
+                ax.set_title("Generated Class Split",fontweight="bold"); st.pyplot(fig); plt.close()
+            with c2:
+                fig,ax=plt.subplots(figsize=(6,4))
+                ax.hist(df_real["Amount"],bins=80,density=True,alpha=0.5,color=C["blue"],label="Real")
+                ax.hist(df_g["Amount"],bins=80,density=True,alpha=0.5,color=C["green"],label="Synthetic")
+                ax.set_title("Amount: Real vs Synthetic",fontweight="bold"); ax.legend(); st.pyplot(fig); plt.close()
+            # 6-feature grid
+            fig,axes=plt.subplots(2,3,figsize=(14,7))
+            for i,col in enumerate(["V1","V2","V3","V4","V14","Amount"]):
+                ax=axes.flatten()[i]
+                ax.hist(df_real[col],bins=60,density=True,alpha=0.4,color=C["blue"],label="Real")
+                ax.hist(df_g[col],bins=60,density=True,alpha=0.4,color=C["green"],label="Synth")
+                j=jsd(df_real[col].values,df_g[col].values)
+                ax.set_title(f"{col}  (JSD={j:.3f})",fontweight="bold",fontsize=10); ax.legend(fontsize=7); ax.set_yticks([])
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+        with t2:
+            st.dataframe(df_g.head(20),use_container_width=True)
+        with t3:
+            jsd_scores={col:jsd(df_real[col].values,df_g[col].values) for col in FEATURES}
+            fig,ax=plt.subplots(figsize=(14,5))
+            colors=[C["red"] if v>0.1 else C["green"] for v in jsd_scores.values()]
+            ax.bar(jsd_scores.keys(),jsd_scores.values(),color=colors,edgecolor="white")
+            ax.axhline(0.1,color="red",ls="--",alpha=0.5)
+            ax.set_title("JSD per Feature (Generated vs Real)",fontweight="bold")
+            ax.set_ylabel("JSD"); plt.xticks(rotation=45,ha="right"); plt.tight_layout(); st.pyplot(fig); plt.close()
+            avg=np.mean(list(jsd_scores.values())); passed=sum(1 for v in jsd_scores.values() if v<0.1)
+            c1,c2=st.columns(2)
+            with c1: mc("Mean JSD",f"{avg:.4f}",C["green"] if avg<0.1 else C["red"])
+            with c2: mc("Columns < 0.1",f"{passed}/{len(FEATURES)}",C["green"] if passed>20 else C["red"])
 
-        st.session_state["generated_data"]=df_gen
-
-        # Metrics
-        m1,m2,m3 = st.columns(3)
-        m1.metric("Total",n_samples);m2.metric("Fraud",n_fraud);m3.metric("Legit",n_legit)
-
-        # Tabs
-        tab1,tab2,tab3 = st.tabs(["Distribution","Data Table","Feature Explorer"])
-        with tab1:
-            fig=px.histogram(df_gen,x="Class",color="Class",color_discrete_map={0:"#378ADD",1:"#D85A30"},
-                            labels={"Class":"Transaction Type"},title="Generated Class Distribution")
-            fig.update_layout(bargap=0.3,showlegend=False)
-            st.plotly_chart(fig,use_container_width=True)
-
-        with tab2:
-            st.dataframe(df_gen.head(30),use_container_width=True)
-
-        with tab3:
-            feat=st.selectbox("Select feature",FEATURES,index=len(FEATURES)-1)
-            fig=px.histogram(df_gen,x=feat,color="Class",nbins=60,opacity=0.7,barmode="overlay",
-                            color_discrete_map={0:"#378ADD",1:"#D85A30"},
-                            title=f"{feat} Distribution by Class")
-            st.plotly_chart(fig,use_container_width=True)
-
-        csv=df_gen.to_csv(index=False).encode()
-        st.download_button("Download CSV",csv,"synthetic_data.csv","text/csv",type="primary",use_container_width=True)
+        st.download_button("Download CSV",df_g.to_csv(index=False).encode(),"synthetic.csv","text/csv",use_container_width=True)
 
 
 # ======== FRAUD DETECTOR ========
-elif page == "🔍 Fraud Detector":
-    st.markdown('<p class="main-header">Fraud Detection</p>',unsafe_allow_html=True)
+elif page=="🔍 Fraud Detector":
+    hdr("🔍 Fraud Detection","Upload or generate data for real-time classification")
+    if clf is None: st.error("Classifier not loaded."); st.stop()
+    src=st.radio("Source",["Upload CSV","Use Generated"],horizontal=True)
+    df_in=None
+    if src=="Upload CSV":
+        f=st.file_uploader("CSV",type=["csv"])
+        if f: df_in=pd.read_csv(f)
+    elif "gen" in st.session_state: df_in=st.session_state["gen"].copy()
+    else: st.warning("Generate data first on Generator page.")
 
-    if clf is None:
-        st.error("fraud_classifier.pkl not found. Run Notebook 6 first.")
-    else:
-        source = st.radio("Data source",["Upload CSV","Use generated data"],horizontal=True)
-        df_input = None
+    if df_in is not None:
+        missing=[c for c in FEATURES if c not in df_in.columns]
+        if missing: st.error(f"Missing: {missing}"); st.stop()
+        proba=clf.predict_proba(df_in[FEATURES].values)[:,1]
+        th=st.slider("Threshold",0.0,1.0,0.5,0.01)
+        preds=(proba>=th).astype(int); nf=preds.sum()
+        c1,c2,c3=st.columns(3)
+        with c1: mc("Transactions",f"{len(df_in):,}",C["blue"])
+        with c2: mc("Fraud",f"{nf:,}",C["red"])
+        with c3: mc("Fraud %",f"{nf/len(df_in)*100:.2f}%",C["pink"])
 
-        if source == "Upload CSV":
-            uploaded = st.file_uploader("Upload CSV with V1-V28 + Amount",type=["csv"])
-            if uploaded: df_input = pd.read_csv(uploaded)
-        else:
-            if "generated_data" in st.session_state:
-                df_input = st.session_state["generated_data"]
-            else:
-                st.info("Generate data first on the Generate Data page.")
+        c1,c2,c3=st.columns(3)
+        with c1:
+            fig,ax=plt.subplots(figsize=(5,4))
+            ax.hist(proba[preds==0],bins=50,alpha=0.6,color=C["blue"],label="Legit",edgecolor="white")
+            ax.hist(proba[preds==1],bins=50,alpha=0.6,color=C["red"],label="Fraud",edgecolor="white")
+            ax.axvline(th,color="red",ls="--",lw=2)
+            ax.set_title("Probability Distribution",fontweight="bold"); ax.legend(); st.pyplot(fig); plt.close()
+        with c2:
+            fig,ax=plt.subplots(figsize=(5,4))
+            ax.pie([len(df_in)-nf,nf],labels=["Legit","Fraud"],colors=[C["blue"],C["red"]],autopct="%1.1f%%",textprops={"fontweight":"bold"})
+            ax.set_title("Detection Split",fontweight="bold"); st.pyplot(fig); plt.close()
+        with c3:
+            fig,ax=plt.subplots(figsize=(5,4))
+            bins=np.linspace(0,1,21)
+            ax.hist(proba,bins=bins,color=C["purple"],edgecolor="white")
+            ax.set_title("Score Distribution",fontweight="bold"); ax.set_xlabel("P(Fraud)"); st.pyplot(fig); plt.close()
 
-        if df_input is not None:
-            missing=[c for c in FEATURES if c not in df_input.columns]
-            if missing:
-                st.error(f"Missing: {missing}")
-            else:
-                threshold = st.slider("Detection Threshold",0.0,1.0,0.5,0.01)
-                proba=clf.predict_proba(df_input[FEATURES].values)[:,1]
-                preds=(proba>=threshold).astype(int)
-                df_input["Probability"]=proba.round(4)
-                df_input["Prediction"]=["Fraud" if p else "Legit" for p in preds]
-                n_fraud=preds.sum()
-
-                # KPIs
-                k1,k2,k3 = st.columns(3)
-                k1.metric("Transactions",len(df_input))
-                k2.metric("Fraud Detected",int(n_fraud))
-                k3.metric("Fraud Rate",f"{n_fraud/len(df_input)*100:.2f}%")
-
-                tab1,tab2,tab3 = st.tabs(["Probability Distribution","Risk Scatter","Predictions"])
-                with tab1:
-                    fig=go.Figure()
-                    fig.add_trace(go.Histogram(x=proba[preds==0],name="Legit",marker_color="#378ADD",opacity=0.7))
-                    fig.add_trace(go.Histogram(x=proba[preds==1],name="Fraud",marker_color="#D85A30",opacity=0.7))
-                    fig.add_vline(x=threshold,line_dash="dash",line_color="red",annotation_text=f"Threshold={threshold}")
-                    fig.update_layout(title="Fraud Probability Distribution",barmode="overlay",
-                                     xaxis_title="Probability",yaxis_title="Count")
-                    st.plotly_chart(fig,use_container_width=True)
-
-                with tab2:
-                    sample_df=df_input.head(2000).copy()
-                    fig=px.scatter(sample_df,x="V1",y="V2",color="Prediction",
-                                  size="Probability",hover_data=["Amount","Probability"],
-                                  color_discrete_map={"Legit":"#378ADD","Fraud":"#D85A30"},
-                                  title="Transaction Risk Map (V1 vs V2)",opacity=0.6)
-                    st.plotly_chart(fig,use_container_width=True)
-
-                with tab3:
-                    st.dataframe(df_input[["Probability","Prediction"]+FEATURES[:5]].head(50),use_container_width=True)
-
-                csv=df_input.to_csv(index=False).encode()
-                st.download_button("Download Predictions",csv,"predictions.csv","text/csv")
+        df_in["Fraud_Prob"]=proba.round(4); df_in["Pred"]=["FRAUD" if p else "LEGIT" for p in preds]
+        st.dataframe(df_in[["Pred","Fraud_Prob"]+FEATURES[:5]].head(30),use_container_width=True)
 
 
-# ======== DISTRIBUTION EXPLORER ========
-elif page == "📊 Distribution Explorer":
-    st.markdown('<p class="main-header">Distribution Explorer</p>',unsafe_allow_html=True)
-    st.markdown("Compare real vs synthetic distributions interactively")
+# ======== DISTRIBUTION LAB ========
+elif page=="📊 Distribution Lab":
+    hdr("📊 Distribution Lab","Interactive feature comparison")
+    c1,c2,c3=st.columns(3)
+    with c1: feat=st.selectbox("Feature",FEATURES,index=FEATURES.index("Amount"))
+    with c2: ns=st.slider("Samples",500,10000,3000,500,key="lab")
+    with c3: bi=st.slider("Bins",20,200,80,10)
 
-    df_real = load_real_data()
+    df_g=gen_synth(ns)
+    fig,ax=plt.subplots(figsize=(12,5))
+    ax.hist(df_real[feat],bins=bi,density=True,alpha=0.5,color=C["blue"],label="Real",edgecolor="white",linewidth=0.5)
+    ax.hist(df_g[feat],bins=bi,density=True,alpha=0.5,color=C["green"],label="Synthetic",edgecolor="white",linewidth=0.5)
+    if df_ctgan is not None and feat in df_ctgan.columns:
+        ax.hist(df_ctgan[feat],bins=bi,density=True,alpha=0.3,color=C["red"],label="CTGAN(saved)",edgecolor="white")
+    j=jsd(df_real[feat].values,df_g[feat].values)
+    ax.set_title(f"{feat}  |  JSD = {j:.4f}",fontsize=14,fontweight="bold"); ax.legend(); st.pyplot(fig); plt.close()
 
-    col1,col2 = st.columns(2)
-    with col1: n_gen=st.slider("Synthetic samples",500,5000,2000,500)
-    with col2: selected_features=st.multiselect("Features",FEATURES,default=["Amount","V1","V2","V3","V4"])
-
-    # Generate
-    n_f=int(n_gen*0.2);n_l=n_gen-n_f;labels=np.concatenate([np.ones(n_f),np.zeros(n_l)]);np.random.shuffle(labels)
-    eye=np.eye(2);cond=torch.tensor(eye[labels.astype(int)],dtype=torch.float32)
-    with torch.no_grad(): out=G(torch.randn(n_gen,128),cond)
-    df_gen=prep.inverse_transform(out);df_gen["Class"]=labels.astype(int)
-
-    # Load CTGAN sample
-    ctgan_path=os.path.join(CKPT_DIR,"synthetic_sample.csv")
-    df_ctgan=pd.read_csv(ctgan_path) if os.path.isfile(ctgan_path) else None
-
-    for feat in selected_features:
-        fig=go.Figure()
-        fig.add_trace(go.Histogram(x=df_real[feat],name="Real",marker_color="#378ADD",opacity=0.5,nbinsx=80))
-        fig.add_trace(go.Histogram(x=df_gen[feat],name="Generated (Live)",marker_color="#1D9E75",opacity=0.5,nbinsx=80))
-        if df_ctgan is not None and feat in df_ctgan.columns:
-            fig.add_trace(go.Histogram(x=df_ctgan[feat],name="CTGAN Sample",marker_color="#D85A30",opacity=0.3,nbinsx=80))
-        fig.update_layout(title=f"{feat} Distribution",barmode="overlay",
-                         xaxis_title=feat,yaxis_title="Count",height=350)
-        st.plotly_chart(fig,use_container_width=True)
-
-    # Stats comparison
-    st.markdown("### Statistics Comparison")
-    stats_rows=[]
-    for feat in selected_features:
-        stats_rows.append({"Feature":feat,
-            "Real Mean":f"{df_real[feat].mean():.4f}","Synth Mean":f"{df_gen[feat].mean():.4f}",
-            "Real Std":f"{df_real[feat].std():.4f}","Synth Std":f"{df_gen[feat].std():.4f}",
-            "JSD":f"{_jsd_column(df_real[feat].values, df_gen[feat].values):.4f}"})
-    st.dataframe(pd.DataFrame(stats_rows),use_container_width=True)
+    # Multi-feature
+    sel=st.multiselect("Compare features",FEATURES,default=["V1","V2","V3","V4","V14","Amount"])
+    if sel:
+        nc=min(len(sel),6); nr=(nc+2)//3
+        fig,axes=plt.subplots(nr,3,figsize=(14,4*nr))
+        axes=np.array(axes).flatten()
+        for i,col in enumerate(sel[:6]):
+            axes[i].hist(df_real[col],bins=50,density=True,alpha=0.5,color=C["blue"],label="Real")
+            axes[i].hist(df_g[col],bins=50,density=True,alpha=0.5,color=C["green"],label="Synth")
+            j=jsd(df_real[col].values,df_g[col].values)
+            axes[i].set_title(f"{col} (JSD={j:.3f})",fontweight="bold",fontsize=10); axes[i].legend(fontsize=7); axes[i].set_yticks([])
+        for j in range(len(sel[:6]),len(axes)): axes[j].set_visible(False)
+        plt.tight_layout(); st.pyplot(fig); plt.close()
 
 
-# ======== TRAINING MONITOR ========
-elif page == "📈 Training Monitor":
-    st.markdown('<p class="main-header">Training Monitor</p>',unsafe_allow_html=True)
+# ======== TRAINING ========
+elif page=="📈 Training":
+    hdr("📈 Training Monitor","WGAN-GP convergence analysis")
+    if history is None: st.error("No training history."); st.stop()
+    ep=len(history["d_loss"])
+    c1,c2,c3,c4=st.columns(4)
+    wd=((history['w_dist'][0]-history['w_dist'][-1])/history['w_dist'][0])*100
+    with c1: mc("Epochs",str(ep),C["blue"])
+    with c2: mc("Final W-Dist",f"{history['w_dist'][-1]:.4f}",C["green"])
+    with c3: mc("Best W-Dist",f"{min(history['w_dist'],key=abs):.4f}",C["purple"])
+    with c4: mc("W-Dist Drop",f"{wd:.1f}%",C["pink"])
 
-    if history is None:
-        st.error("training_history.pkl not found.")
-    else:
-        epochs=len(history["d_loss"])
+    rng=st.slider("Epoch range",1,ep,(1,ep))
+    fig,axes=plt.subplots(2,2,figsize=(14,9))
+    axes=axes.flatten()
+    for ax,key,label,color in zip(axes,["d_loss","g_loss","gp","w_dist"],["D Loss","G Loss","Gradient Penalty","W-Distance"],[C["red"],C["blue"],C["purple"],C["green"]]):
+        d=history[key][rng[0]-1:rng[1]]
+        ax.plot(range(rng[0],rng[0]+len(d)),d,color=color,linewidth=1.8)
+        ax.fill_between(range(rng[0],rng[0]+len(d)),d,alpha=0.1,color=color)
+        ax.set_title(label,fontweight="bold",fontsize=12); ax.set_xlabel("Epoch"); ax.grid(alpha=0.2)
+    plt.suptitle(f"WGAN-GP Training (Epochs {rng[0]}-{rng[1]})",fontsize=14,fontweight="bold",y=1.01)
+    plt.tight_layout(); st.pyplot(fig); plt.close()
 
-        # KPIs
-        k1,k2,k3,k4 = st.columns(4)
-        k1.metric("Epochs",epochs)
-        k2.metric("Final W-Dist",f"{history['w_dist'][-1]:.4f}",
-                  delta=f"{history['w_dist'][-1]-history['w_dist'][0]:.2f}")
-        k3.metric("Final D Loss",f"{history['d_loss'][-1]:.4f}")
-        k4.metric("Final G Loss",f"{history['g_loss'][-1]:.4f}")
-
-        # Epoch range
-        ep_range=st.slider("Epoch range",1,epochs,(1,epochs))
-
-        # Interactive Plotly training curves
-        fig=make_subplots(rows=2,cols=2,subplot_titles=["Discriminator Loss","Generator Loss","Gradient Penalty","Wasserstein Distance"])
-        ep=list(range(ep_range[0],ep_range[1]+1))
-        for row,col,key,color in [(1,1,"d_loss","#D85A30"),(1,2,"g_loss","#378ADD"),(2,1,"gp","#7F77DD"),(2,2,"w_dist","#1D9E75")]:
-            data=history[key][ep_range[0]-1:ep_range[1]]
-            fig.add_trace(go.Scatter(x=ep,y=data,mode="lines",line=dict(color=color,width=2),name=key,
-                                     hovertemplate="Epoch %{x}<br>Value: %{y:.4f}"),row=row,col=col)
-        fig.update_layout(height=600,title_text=f"WGAN-GP Training Curves (Epochs {ep_range[0]}-{ep_range[1]})",
-                         showlegend=False)
-        st.plotly_chart(fig,use_container_width=True)
-
-        # Training analysis
-        w_imp=((history["w_dist"][0]-history["w_dist"][-1])/history["w_dist"][0])*100
-        st.markdown(f"""
-        ### Analysis
-        - W-Distance reduced by **{w_imp:.1f}%** ({history['w_dist'][0]:.4f} -> {history['w_dist'][-1]:.4f})
-        - Generator loss trend: **{'Increasing (D overpowering G)' if history['g_loss'][-1]>history['g_loss'][0] else 'Decreasing (healthy)'}**
-        - Gradient penalty converged to **{history['gp'][-1]:.4f}**
-        """)
+    # Loss ratio chart
+    fig,ax=plt.subplots(figsize=(12,4))
+    d_arr=np.array(history["d_loss"][rng[0]-1:rng[1]])
+    g_arr=np.array(history["g_loss"][rng[0]-1:rng[1]])
+    x=range(rng[0],rng[0]+len(d_arr))
+    ax.plot(x,d_arr,color=C["red"],label="D Loss",linewidth=1.5)
+    ax.plot(x,g_arr,color=C["blue"],label="G Loss",linewidth=1.5)
+    ax.fill_between(x,d_arr,g_arr,alpha=0.1,color=C["purple"])
+    ax.set_title("D vs G Loss Gap",fontweight="bold"); ax.legend(); ax.grid(alpha=0.2)
+    st.pyplot(fig); plt.close()
 
 
-# ======== MODEL COMPARISON ========
-elif page == "🏆 Model Comparison":
-    st.markdown('<p class="main-header">CTGAN vs Flow Matching</p>',unsafe_allow_html=True)
+# ======== EVALUATION ========
+elif page=="🧪 Evaluation":
+    hdr("🧪 Evaluation Suite","Statistical Fidelity | ML Efficacy | Privacy")
+    t1,t2,t3=st.tabs(["Statistical Fidelity","ML Efficacy","Privacy"])
+    with t1:
+        c1,c2=st.columns(2)
+        with c1:
+            p=os.path.join(CKPT_DIR,"figA_jsd.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
+        with c2:
+            p=os.path.join(CKPT_DIR,"figB_correlation.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
+    with t2:
+        c1,c2=st.columns(2)
+        with c1:
+            p=os.path.join(CKPT_DIR,"figF_roc.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
+        with c2:
+            p=os.path.join(CKPT_DIR,"figG_feature_importance.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
+        for csv_name in ["ml_efficacy.csv","classifier_results.csv"]:
+            p=os.path.join(CKPT_DIR,csv_name)
+            if os.path.isfile(p): st.dataframe(pd.read_csv(p),use_container_width=True)
+    with t3:
+        c1,c2=st.columns(2)
+        with c1:
+            p=os.path.join(CKPT_DIR,"figD_nndr.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
+        with c2:
+            p=os.path.join(CKPT_DIR,"figI_nndr_comparison.png")
+            if os.path.isfile(p): st.image(p,use_container_width=True)
 
-    tab1,tab2,tab3,tab4,tab5 = st.tabs(["JSD Comparison","NNDR Privacy","Distributions","ML Efficacy","All Figures"])
 
-    with tab1:
+# ======== GAN vs FM ========
+elif page=="⚔️ GAN vs FM":
+    hdr("⚔️ CTGAN vs Flow Matching","Adversarial vs Non-Adversarial Comparison")
+
+    c1,c2=st.columns(2)
+    with c1:
         p=os.path.join(CKPT_DIR,"figH_jsd_comparison.png")
         if os.path.isfile(p): st.image(p,use_container_width=True)
-
-        fm_path=os.path.join(CKPT_DIR,"flow_matching_comparison.csv")
-        if os.path.isfile(fm_path):
-            df_fm=pd.read_csv(fm_path)
-            st.dataframe(df_fm,use_container_width=True)
-
-    with tab2:
-        p=os.path.join(CKPT_DIR,"figI_nndr_comparison.png")
-        if os.path.isfile(p): st.image(p,use_container_width=True)
-
-    with tab3:
+    with c2:
         p=os.path.join(CKPT_DIR,"figJ_three_way.png")
         if os.path.isfile(p): st.image(p,use_container_width=True)
 
-    with tab4:
-        for csv_name,title in [("ml_efficacy.csv","TSTR vs TRTR"),("classifier_results.csv","3-Way Classifier")]:
-            p=os.path.join(CKPT_DIR,csv_name)
-            if os.path.isfile(p):
-                st.markdown(f"**{title}**")
-                df=pd.read_csv(p)
-                st.dataframe(df,use_container_width=True)
-
-                if "ROC-AUC" in df.columns:
-                    fig=px.bar(df,x="Setup",y="ROC-AUC",color="Setup",
-                              color_discrete_sequence=["#378ADD","#D85A30","#1D9E75"],
-                              title=f"{title} - ROC-AUC Comparison")
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(fig,use_container_width=True)
-
-        p=os.path.join(CKPT_DIR,"figF_roc.png")
+    c1,c2=st.columns(2)
+    with c1:
+        p=os.path.join(CKPT_DIR,"figI_nndr_comparison.png")
+        if os.path.isfile(p): st.image(p,use_container_width=True)
+    with c2:
+        p=os.path.join(CKPT_DIR,"flow_matching_comparison.csv")
         if os.path.isfile(p):
-            st.markdown("**ROC Curves**")
-            st.image(p,use_container_width=True)
+            df_comp=pd.read_csv(p)
+            st.dataframe(df_comp,use_container_width=True)
 
-    with tab5:
-        st.markdown("### All Evaluation Figures")
-        figs=[
-            ("figA_jsd.png","JSD per Column"),
-            ("figB_correlation.png","Correlation Structure"),
-            ("figD_nndr.png","Privacy NNDR"),
-            ("figE_training_recap.png","Training Curves"),
-            ("figF_roc.png","ROC Curves"),
-            ("figG_feature_importance.png","Feature Importances"),
-            ("figH_jsd_comparison.png","JSD: CTGAN vs FM"),
-            ("figI_nndr_comparison.png","NNDR Comparison"),
-            ("figJ_three_way.png","3-Way Distribution"),
-        ]
-        for fname,caption in figs:
-            p=os.path.join(CKPT_DIR,fname)
-            if os.path.isfile(p):
-                with st.expander(caption,expanded=False):
-                    st.image(p,use_container_width=True)
+    # Side-by-side bar chart
+    p=os.path.join(CKPT_DIR,"flow_matching_comparison.csv")
+    if os.path.isfile(p):
+        df_c=pd.read_csv(p)
+        if "Flow Matching" in df_c.columns and "CTGAN (AnalyticGAN)" in df_c.columns:
+            fig,ax=plt.subplots(figsize=(10,5))
+            metrics=df_c["Metric"].tolist()
+            fm_vals=[]; ct_vals=[]
+            for _,row in df_c.iterrows():
+                try: fm_vals.append(float(row["Flow Matching"]))
+                except: fm_vals.append(0)
+                try: ct_vals.append(float(row["CTGAN (AnalyticGAN)"]))
+                except: ct_vals.append(0)
+            x=np.arange(len(metrics)); w=0.35
+            ax.bar(x-w/2,ct_vals,w,color=C["red"],label="CTGAN",edgecolor="white")
+            ax.bar(x+w/2,fm_vals,w,color=C["green"],label="Flow Matching",edgecolor="white")
+            ax.set_xticks(x); ax.set_xticklabels(metrics,rotation=15)
+            ax.set_title("CTGAN vs Flow Matching — All Metrics",fontweight="bold",fontsize=13)
+            ax.legend(fontsize=11); ax.grid(axis="y",alpha=0.2)
+            plt.tight_layout(); st.pyplot(fig); plt.close()
+
+
+# ======== METRICS (chart-only) ========
+elif page=="📉 Metrics":
+    hdr("📉 Key Metrics","ROC-AUC and scores from saved runs")
+    r1,r2=st.columns(2)
+    with r1:
+        p_ml=os.path.join(CKPT_DIR,"ml_efficacy.csv")
+        if os.path.isfile(p_ml):
+            dfm=pd.read_csv(p_ml)
+            if "Setup" in dfm.columns and "ROC-AUC" in dfm.columns:
+                fig,ax=plt.subplots(figsize=(10,5))
+                setups=dfm["Setup"].astype(str).tolist()
+                aucs=[float(x) if pd.notna(x) else 0.0 for x in dfm["ROC-AUC"]]
+                cols=[C["blue"],C["red"],C["green"],C["purple"],C["pink"]]
+                bar_c=[cols[i % len(cols)] for i in range(len(setups))]
+                ax.barh(setups,aucs,color=bar_c,edgecolor="white")
+                ax.set_xlabel("ROC-AUC"); ax.set_title("ML Efficacy (ml_efficacy.csv)",fontweight="bold")
+                ax.set_xlim(0,1); ax.grid(axis="x",alpha=0.2)
+                plt.tight_layout(); st.pyplot(fig); plt.close()
+    with r2:
+        p_cl=os.path.join(CKPT_DIR,"classifier_results.csv")
+        if os.path.isfile(p_cl):
+            dfc=pd.read_csv(p_cl)
+            if "Setup" in dfc.columns and "ROC-AUC" in dfc.columns:
+                fig,ax=plt.subplots(figsize=(10,5))
+                setups=dfc["Setup"].astype(str).tolist()
+                aucs=[float(x) if pd.notna(x) else 0.0 for x in dfc["ROC-AUC"]]
+                ax.bar(range(len(setups)),aucs,color=C["purple"],edgecolor="white")
+                ax.set_xticks(range(len(setups))); ax.set_xticklabels(setups,rotation=25,ha="right")
+                ax.set_ylabel("ROC-AUC"); ax.set_title("Classifier comparison",fontweight="bold")
+                ax.set_ylim(0,1); ax.grid(axis="y",alpha=0.2)
+                plt.tight_layout(); st.pyplot(fig); plt.close()
+    p_fm=os.path.join(CKPT_DIR,"flow_matching_comparison.csv")
+    if os.path.isfile(p_fm):
+        df_fm=pd.read_csv(p_fm)
+        cols=[c for c in df_fm.columns if c!="Metric"]
+        if cols:
+            fig,ax=plt.subplots(figsize=(12,5))
+            metrics=df_fm["Metric"].astype(str).tolist()
+            x=np.arange(len(metrics)); w=0.8/len(cols)
+            for i,cname in enumerate(cols):
+                vals=[]
+                for _,row in df_fm.iterrows():
+                    try: vals.append(float(row[cname]))
+                    except: vals.append(0.0)
+                ax.bar(x+(i-len(cols)/2)*w+w/2,vals,w,label=cname,edgecolor="white")
+            ax.set_xticks(x); ax.set_xticklabels(metrics,rotation=20,ha="right")
+            ax.set_title("Flow matching comparison table (numeric columns)",fontweight="bold")
+            ax.legend(fontsize=9); ax.grid(axis="y",alpha=0.2)
+            plt.tight_layout(); st.pyplot(fig); plt.close()
