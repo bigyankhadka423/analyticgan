@@ -6,4 +6,5 @@ scipy
 scikit-learn
 kagglehub
 streamlit
+plotly
 joblib
