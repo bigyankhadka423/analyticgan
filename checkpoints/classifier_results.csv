@@ -1,4 +1,4 @@
 Setup,Accuracy,Precision,Recall,F1,ROC-AUC
 Real only,0.9995,0.961,0.7551,0.8457,0.9572
-Synthetic only,0.9983,0.0,0.0,0.0,0.6204
-Mixed (best),0.9995,0.96,0.7347,0.8324,0.9561
+Synthetic only,0.9983,0.0,0.0,0.0,0.4586
+Mixed (best),0.9995,0.9595,0.7245,0.8256,0.9556

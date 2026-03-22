@@ -1,5 +1,5 @@
 Metric,Flow Matching,CTGAN (AnalyticGAN)
-Mean JSD,0.0298,0.3124
-TSTR ROC-AUC,0.8195,0.4072
-Mean NNDR,0.8859,0.9711
-Training Time (s),633.0,see nb4
+Mean JSD,0.029,0.3124
+TSTR ROC-AUC,0.4865,0.4738
+Mean NNDR,0.8841,0.9711
+Training Time (s),1620.0,see nb4
