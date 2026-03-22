@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+kagglehub
+streamlit
+joblib
