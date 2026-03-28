@@ -1,8 +1,21 @@
 """
 AnalyticGAN -- Chart-focused Streamlit dashboard (matplotlib only).
-Run: cd analyticgan && python -m streamlit run app/streamlit_app.py
+
+Run from the project root folder (the directory that contains `app/` and `checkpoints/`),
+e.g. in PowerShell (use quotes when the path has spaces):
+
+    Set-Location "C:\\Users\\You\\...\\analyticgan"
+    python -m streamlit run .\\app\\streamlit_app.py
+
+Or with an explicit script path:
+
+    python -m streamlit run "C:\\...\\analyticgan\\app\\streamlit_app.py"
+
+Paths to `checkpoints/` are resolved from this file's location, but Streamlit's working
+directory should still be the project root so relative assets behave consistently.
 """
 
+import inspect
 import os
 import pickle
 import sys
@@ -107,6 +120,63 @@ plt.rcParams.update(
         "axes.spines.right": False,
     }
 )
+
+
+def _safe_torch_load(path: str):
+    """PyTorch 2.6+ defaults weights_only=True; full checkpoints need weights_only=False."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _st_image_wide(path: str):
+    """Streamlit >= 1.46 uses width=... instead of use_container_width."""
+    try:
+        sig = inspect.signature(st.image)
+        if "width" in sig.parameters:
+            st.image(path, width="stretch")
+        else:
+            st.image(path, use_container_width=True)
+    except Exception:
+        st.image(path)
+
+
+def _st_dataframe_wide(df):
+    try:
+        sig = inspect.signature(st.dataframe)
+        if "width" in sig.parameters:
+            st.dataframe(df, width="stretch")
+        else:
+            st.dataframe(df, use_container_width=True)
+    except Exception:
+        st.dataframe(df)
+
+
+def _generate_synthetic_df(G, prep, n_samples: int, fraud_pct: float, chunk: int = 400):
+    """
+    Chunked forward passes — the generator's self-attention is O(batch^2) in memory;
+    large sliders (e.g. 8000) would otherwise OOM or hang.
+    """
+    dev = next(G.parameters()).device
+    n_fraud = int(n_samples * fraud_pct)
+    n_legit = n_samples - n_fraud
+    labels = np.concatenate([np.ones(n_fraud), np.zeros(n_legit)])
+    np.random.shuffle(labels)
+    eye = np.eye(2)
+    parts = []
+    for start in range(0, n_samples, chunk):
+        end = min(start + chunk, n_samples)
+        bs = end - start
+        lab = labels[start:end]
+        cond = torch.tensor(eye[lab.astype(int)], dtype=torch.float32, device=dev)
+        z = torch.randn(bs, 128, device=dev)
+        with torch.no_grad():
+            parts.append(G(z, cond))
+    out = torch.cat(parts, dim=0)
+    df_gen = prep.inverse_transform(out)
+    df_gen["Class"] = labels.astype(int)
+    return df_gen
 
 
 def hdr(t, s=""):
@@ -270,6 +340,10 @@ class Generator(nn.Module):
 
 @st.cache_resource
 def load_models():
+    for _req in ("preprocessor.pkl", "cond_vec.npy", "generator_final.pt"):
+        _rp = os.path.join(CKPT_DIR, _req)
+        if not os.path.isfile(_rp):
+            raise FileNotFoundError(_rp)
     prep = TabularPreprocessor.load(os.path.join(CKPT_DIR, "preprocessor.pkl"))
     cond_vec = np.load(os.path.join(CKPT_DIR, "cond_vec.npy"))
     G = Generator(
@@ -278,7 +352,7 @@ def load_models():
         output_dim=prep.output_dim,
         output_info=prep.output_info,
     )
-    _sd = torch.load(os.path.join(CKPT_DIR, "generator_final.pt"), map_location="cpu")
+    _sd = _safe_torch_load(os.path.join(CKPT_DIR, "generator_final.pt"))
     _sd = {k.replace("_orig_mod.", ""): v for k, v in _sd.items()}
     G.load_state_dict(_sd)
     G.eval()
@@ -296,14 +370,29 @@ def load_models():
 def _load_real_credit_df():
     try:
         import kagglehub
+        from pathlib import Path
 
-        p = kagglehub.dataset_download("mlg-ulb/creditcardfraud")
-        return pd.read_csv(os.path.join(p, "creditcard.csv"))
+        root = Path(kagglehub.dataset_download("mlg-ulb/creditcardfraud"))
+        cands = list(root.rglob("creditcard.csv"))
+        if not cands:
+            return None
+        return pd.read_csv(cands[0])
     except Exception:
         return None
 
 
-prep, cond_vec, G, clf, history = load_models()
+try:
+    prep, cond_vec, G, clf, history = load_models()
+except FileNotFoundError as e:
+    st.error("Missing checkpoint file. Run the training / notebook pipeline first.")
+    st.code(str(e))
+    st.caption(f"Looked under: `{CKPT_DIR}`")
+    st.stop()
+except Exception as e:
+    st.error("Could not load models from `checkpoints/`. See error below.")
+    st.exception(e)
+    st.caption(f"Project root: `{BASE}` | Checkpoints: `{CKPT_DIR}`")
+    st.stop()
 
 
 with st.sidebar:
@@ -460,18 +549,10 @@ elif page == "⚡ Generate":
     with c2:
         fraud_pct = st.slider("Fraud %", 1, 50, 20, 1) / 100.0
     if st.button("Run generator", type="primary"):
-        with st.spinner(""):
-            n_fraud = int(n_samples * fraud_pct)
-            n_legit = n_samples - n_fraud
-            labels = np.concatenate([np.ones(n_fraud), np.zeros(n_legit)])
-            np.random.shuffle(labels)
-            eye = np.eye(2)
-            cond = torch.tensor(eye[labels.astype(int)], dtype=torch.float32)
-            with torch.no_grad():
-                z = torch.randn(n_samples, 128)
-                out = G(z, cond)
-            df_gen = prep.inverse_transform(out)
-            df_gen["Class"] = labels.astype(int)
+        with st.spinner("Generating (chunked for memory safety)..."):
+            df_gen = _generate_synthetic_df(G, prep, n_samples, fraud_pct, chunk=400)
+        n_fraud = int((df_gen["Class"] == 1).sum())
+        n_legit = int((df_gen["Class"] == 0).sum())
 
         m1, m2, m3 = st.columns(3)
         with m1:
@@ -539,16 +620,8 @@ elif page == "📊 Distributions":
     hdr("Real vs synthetic", "1D densities | 2D feature scatter")
     df_real = _load_real_credit_df()
     n_gen = st.slider("Synthetic n", 500, 5000, 2000, 250)
-    with st.spinner(""):
-        n_fraud = int(n_gen * 0.2)
-        n_legit = n_gen - n_fraud
-        labels = np.concatenate([np.ones(n_fraud), np.zeros(n_legit)])
-        np.random.shuffle(labels)
-        cond = torch.tensor(np.eye(2)[labels.astype(int)], dtype=torch.float32)
-        with torch.no_grad():
-            z = torch.randn(n_gen, 128)
-            out = G(z, cond)
-        df_gen = prep.inverse_transform(out)
+    with st.spinner("Generating synthetic slice (chunked)..."):
+        df_gen = _generate_synthetic_df(G, prep, n_gen, 0.2, chunk=400)
 
     tab_1d, tab_2d = st.tabs(["1D marginal density", "2D scatter (X vs Y)"])
 
@@ -810,28 +883,28 @@ elif page == "⚔️ GAN vs FM":
     with c1:
         p = os.path.join(CKPT_DIR, "figH_jsd_comparison.png")
         if os.path.isfile(p):
-            st.image(p, use_container_width=True)
+            _st_image_wide(p)
     with c2:
         p = os.path.join(CKPT_DIR, "figJ_three_way.png")
         if os.path.isfile(p):
-            st.image(p, use_container_width=True)
+            _st_image_wide(p)
 
     # Row 2: NNDR + FM training
     c1, c2 = st.columns(2)
     with c1:
         p = os.path.join(CKPT_DIR, "figI_nndr_comparison.png")
         if os.path.isfile(p):
-            st.image(p, use_container_width=True)
+            _st_image_wide(p)
     with c2:
         p = os.path.join(CKPT_DIR, "figH_fm_training.png")
         if os.path.isfile(p):
-            st.image(p, use_container_width=True)
+            _st_image_wide(p)
 
     # Interactive metrics table + chart
     p = os.path.join(CKPT_DIR, "flow_matching_comparison.csv")
     if os.path.isfile(p):
         df_c = pd.read_csv(p)
-        st.dataframe(df_c, use_container_width=True)
+        _st_dataframe_wide(df_c)
 
         # Select metric to visualize
         metrics_list = df_c["Metric"].tolist()
